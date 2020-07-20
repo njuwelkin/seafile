@@ -2880,7 +2880,7 @@ out:
 #define ID_LIST_SEGMENT_N 1000
 
 static int
-upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *url,
+check_id_list_segment (HttpTxTask *task, Connection *conn, const char *url,
                               GList **send_id_list, GList **recv_id_list)
 {
     json_t *array;
@@ -3723,8 +3723,8 @@ http_upload_thread (void *vdata)
                                task->host, task->repo_id);
 
     while (send_fs_list != NULL) {
-        if (upload_check_id_list_segment (task, conn, url,
-                                          &send_fs_list, &needed_fs_list) < 0) {
+        if (check_id_list_segment (task, conn, url,
+                                   &send_fs_list, &needed_fs_list) < 0) {
             seaf_warning ("Failed to check fs list for repo %.8s.\n", task->repo_id);
             goto out;
         }
@@ -3762,8 +3762,8 @@ http_upload_thread (void *vdata)
                                task->host, task->repo_id);
 
     while (block_list != NULL) {
-        if (upload_check_id_list_segment (task, conn, url,
-                                          &block_list, &needed_block_list) < 0) {
+        if (check_id_list_segment (task, conn, url,
+                                   &block_list, &needed_block_list) < 0) {
             seaf_warning ("Failed to check block list for repo %.8s.\n",
                           task->repo_id);
             goto out;
@@ -4381,6 +4381,19 @@ error:
     return ret;
 }
 
+static void
+calculate_block_list_by_file (Seafile *file, GList **plist)
+{
+    int i;
+    char *block_id;
+    for (i = 0; i < file->n_blocks; ++i) {
+        block_id = file->blk_sha1s[i];
+        *plist = g_list_prepend (*plist, g_strdup(block_id));
+    }
+
+    return;
+}
+
 int
 http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
 {
@@ -4389,6 +4402,8 @@ http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
     ConnectionPool *pool;
     Connection *conn;
     int ret = 0;
+    GList *block_list = NULL, *needed_block_list = NULL;
+    char *url = NULL;
 
     file = seaf_fs_manager_get_seafile (seaf->fs_mgr,
                                         task->repo_id,
@@ -4416,6 +4431,37 @@ http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
         return -1;
     }
 
+    calculate_block_list_by_file (file, &block_list);
+
+    if (!task->use_fileserver_port)
+        url = g_strdup_printf ("%s/seafhttp/repo/%s/check-blocks/",
+                               task->host, task->repo_id);
+    else
+        url = g_strdup_printf ("%s/repo/%s/check-blocks/",
+                               task->host, task->repo_id);
+    while (block_list != NULL) {
+        if (check_id_list_segment (task, conn, url,
+                                   &block_list, &needed_block_list) < 0) {
+            seaf_warning ("Failed to check block list for repo %.8s.\n",
+                          task->repo_id);
+            ret = -1;
+            goto out;
+        }
+
+        if (task->state == HTTP_TASK_STATE_CANCELED) {
+            seafile_unref (file);
+            ret = -1;
+            goto out;
+        }
+    }
+
+    if (needed_block_list != NULL) {
+        seaf_warning ("Failed to check block list for repo %.8s.\n",
+                      task->repo_id);
+        ret = -1;
+        goto out;
+    }
+
     int i;
     char *block_id;
     for (i = 0; i < file->n_blocks; ++i) {
@@ -4425,9 +4471,12 @@ http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id)
             break;
     }
 
+out:
     connection_pool_return_connection (pool, conn);
-
+    g_free (url);
     seafile_unref (file);
+    string_list_free (block_list);
+    string_list_free (needed_block_list);
 
     return ret;
 }
